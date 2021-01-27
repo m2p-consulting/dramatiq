@@ -284,7 +284,7 @@ class RedisBroker(Broker):
 
 
 class _RedisConsumer(Consumer):
-    def __init__(self, broker, queue_name, prefetch, timeout):
+    def __init__(self, broker: RedisBroker, queue_name, prefetch, timeout):
         self.logger = get_logger(__name__, type(self))
         self.broker = broker
         self.queue_name = queue_name
@@ -354,12 +354,34 @@ class _RedisConsumer(Consumer):
                             self.prefetch - self.outstanding_message_count,
                         )
 
-                    # Because we didn't get any messages, we should
-                    # progressively long poll up to the idle timeout.
+                    # Because we didn't get any messages, we try to read a single
+                    # message in a blocking fashion.
                     if not messages:
-                        self.misses, backoff_ms = compute_backoff(self.misses, max_backoff=self.timeout)
-                        time.sleep(backoff_ms / 1000)
+                        queue_acks = f"{self.broker.namespace}:__acks__.{self.broker.broker_id}.{self.queue_name}"
+                        queue_full_name = f"{self.broker.namespace}:{self.queue_name}"
+                        queue_messages = f"{queue_full_name}.msgs"
+
+                        # We block for a relatively short time to allow the thread to
+                        # terminate if requested.
+                        # Some jitter is applied to not wake up all threads at the same
+                        # time.
+                        # TODO: Should this use self.timeout? This value is pretty short
+                        #  though.
+                        timeout = int(random.uniform(1, 5))
+
+                        message_id = self.broker.client.brpoplpush(
+                            queue_full_name,
+                            queue_acks,
+                            timeout
+                        )
+                        if message_id is not None:
+                            self.message_cache = self.broker.client.hmget(
+                                queue_messages,
+                                [message_id]
+                            )
+
                         return None
+
         except redis.ConnectionError as e:
             raise ConnectionClosed(e) from None
 

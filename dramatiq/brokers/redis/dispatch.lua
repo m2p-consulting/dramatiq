@@ -113,10 +113,10 @@ if do_maintenance == "1" then
         local dead_worker = dead_workers[i]
         local dead_worker_acks = namespace .. ":__acks__." .. dead_worker
         local dead_worker_queue_acks = dead_worker_acks .. "." .. queue_name
-        local message_ids = redis.call("smembers", dead_worker_queue_acks)
+        local message_ids = redis.call("lrange", dead_worker_queue_acks, 0, -1)
         if next(message_ids) then
             for message_ids_batch in iter_chunks(message_ids) do
-                redis.call("rpush", queue_full_name, unpack(message_ids_batch))
+                redis.call("lpush", queue_full_name, unpack(message_ids_batch))
             end
             redis.call("del", dead_worker_queue_acks)
         end
@@ -144,7 +144,7 @@ if do_maintenance == "1" then
     local compat_message_ids = redis.call("zrangebyscore", compat_queue_acks, 0, timestamp - 86400000 * 7.5)
     if next(compat_message_ids) then
         for compat_message_ids_batch in iter_chunks(compat_message_ids) do
-            redis.call("sadd", queue_acks, unpack(compat_message_ids_batch))
+            redis.call("lpush", queue_acks, unpack(compat_message_ids_batch))
             redis.call("zrem", compat_queue_acks, unpack(compat_message_ids_batch))
         end
     end
@@ -157,7 +157,7 @@ if command == "enqueue" then
     local message_data = ARGS[2]
 
     redis.call("hset", queue_messages, message_id, message_data)
-    redis.call("rpush", queue_full_name, message_id)
+    redis.call("lpush", queue_full_name, message_id)
 
 
 -- Returns up to $prefetch number of messages from $queue_full_name.
@@ -167,13 +167,12 @@ elseif command == "fetch" then
 
     local message_ids = {}
     for i=1,prefetch do
-        local message_id = redis.call("lpop", queue_full_name)
+        local message_id = redis.call("rpoplpush", queue_full_name, queue_acks)
         if not message_id then
             break
         end
 
         message_ids[i] = message_id
-        redis.call("sadd", queue_acks, message_id)
     end
 
     if next(message_ids) ~= nil then
@@ -189,9 +188,9 @@ elseif command == "requeue" then
     for i=1,#ARGS do
         local message_id = ARGS[i]
 
-        redis.call("srem", queue_acks, message_id)
+        redis.call("lrem", queue_acks, -1, message_id)
         if redis.call("hexists", queue_messages, message_id) then
-            redis.call("rpush", queue_full_name, message_id)
+            redis.call("lpush", queue_full_name, message_id)
         end
     end
 
@@ -201,7 +200,7 @@ elseif command == "ack" then
     local message_id = ARGS[1]
 
     redis.call("hdel", queue_messages, message_id)
-    redis.call("srem", queue_acks, message_id)
+    redis.call("lrem", queue_acks, -1, message_id)
 
 
 -- Moves a message from a queue to a dead-letter queue.
@@ -209,7 +208,7 @@ elseif command == "nack" then
     local message_id = ARGS[1]
 
     -- unack the message
-    redis.call("srem", queue_acks, message_id)
+    redis.call("lrem", queue_acks, -1, message_id)
 
     -- then pop it off the messages hash and move it onto the DLQ
     local message = redis.call("hget", queue_messages, message_id)
@@ -227,6 +226,6 @@ elseif command == "purge" then
 
 -- Used in tests to determine the size of the queue.
 elseif command == "qsize" then
-    return redis.call("hlen", queue_messages) + redis.call("scard", queue_acks)
+    return redis.call("hlen", queue_messages) + redis.call("llen", queue_acks)
 
 end
